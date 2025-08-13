@@ -1,0 +1,142 @@
+// server/places-proxy.cjs
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ====== Config / Helpers ======
+const PORT = process.env.PORT || 8787;
+const MAPS_KEY = process.env.MAPS_KEY || '';
+const FIELD_MASK = 'places.id,places.displayName,places.location,places.primaryType,places.primaryTypeDisplayName';
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'features.json');
+
+function maskKey(k){ if(!k) return '(empty)'; return k.length<=10?k:(k.slice(0,6)+'...'+k.slice(-4)); }
+function clampRadius(m){ return Math.max(100, Math.min(50000, Number(m||30000))); }
+
+// ====== Health ======
+app.get('/health', (req, res) => {
+  res.json({ ok:true, hasKey: !!MAPS_KEY, keyPreview: maskKey(MAPS_KEY), base:'https://places.googleapis.com/v1' });
+});
+
+// ====== Google Places Proxy ======
+app.get('/placesSearchText', async (req, res) => {
+  try{
+    if (!MAPS_KEY) return res.status(500).json({ error:'MAPS_KEY missing' });
+    const query = String(req.query.query || 'tourist attractions in Switzerland');
+    const lat = Number(req.query.lat || 46.8182);
+    const lng = Number(req.query.lng || 8.2275);
+    const radius = clampRadius(req.query.radius);
+
+    const r = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method:'POST',
+      headers: {
+        'X-Goog-Api-Key': MAPS_KEY,
+        'X-Goog-FieldMask': FIELD_MASK,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        textQuery: query,
+        locationBias: { circle: { center: { latitude: lat, longitude: lng }, radius } }
+      })
+    });
+    const text = await r.text();
+    if (!r.ok) console.error('[UPSTREAM ERROR searchText]', r.status, text);
+    res.status(r.status).type('application/json').send(text);
+  }catch(e){ res.status(500).json({ proxyError: String(e?.message||e) }); }
+});
+
+app.get('/placesNearby', async (req, res) => {
+  try{
+    if (!MAPS_KEY) return res.status(500).json({ error:'MAPS_KEY missing' });
+    const lat = Number(req.query.lat || 46.8182);
+    const lng = Number(req.query.lng || 8.2275);
+    const radius = clampRadius(req.query.radius);
+    const allow = new Set(['restaurant','lodging','tourist_attraction']);
+    const rawType = String(req.query.type || 'tourist_attraction');
+    const type = allow.has(rawType) ? rawType : 'tourist_attraction';
+
+    const r = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+      method:'POST',
+      headers: {
+        'X-Goog-Api-Key': MAPS_KEY,
+        'X-Goog-FieldMask': FIELD_MASK,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        includedTypes: [type],
+        maxResultCount: 50,
+        locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius } }
+      })
+    });
+    const text = await r.text();
+    if (!r.ok) console.error('[UPSTREAM ERROR nearby]', r.status, text);
+    res.status(r.status).type('application/json').send(text);
+  }catch(e){ res.status(500).json({ proxyError: String(e?.message||e) }); }
+});
+
+// ====== Local JSON storage (dev backend) ======
+function readAll() {
+  try {
+    const txt = fs.readFileSync(DATA_FILE, 'utf8');
+    return JSON.parse(txt || '[]');
+  } catch(e) {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DATA_FILE, '[]');
+    return [];
+  }
+}
+function writeAll(arr) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DATA_FILE, JSON.stringify(arr, null, 2));
+}
+function newId() { return `${Date.now()}_${Math.floor(Math.random()*1e6)}`; }
+
+app.get('/api/features', (req, res) => {
+  res.json(readAll());
+});
+
+app.post('/api/features', (req, res) => {
+  const now = Date.now();
+  const arr = readAll();
+  const payload = Array.isArray(req.body) ? req.body : [req.body];
+  const saved = payload.map(f => {
+    const id = f.id || newId();
+    const doc = { id, ...f, createdAt: f.createdAt || now, updatedAt: now };
+    arr.push(doc);
+    return doc;
+  });
+  writeAll(arr);
+  res.status(201).json(saved.length === 1 ? saved[0] : saved);
+});
+
+app.put('/api/features/:id', (req, res) => {
+  const id = req.params.id;
+  const arr = readAll();
+  const idx = arr.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'not found' });
+  arr[idx] = { ...arr[idx], ...req.body, id, updatedAt: Date.now() };
+  writeAll(arr);
+  res.json(arr[idx]);
+});
+
+app.delete('/api/features/:id', (req, res) => {
+  const id = req.params.id;
+  const arr = readAll();
+  const idx = arr.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'not found' });
+  const [gone] = arr.splice(idx, 1);
+  writeAll(arr);
+  res.json({ ok: true, id: gone.id });
+});
+
+// ====== Start ======
+app.listen(PORT, () => {
+  console.log(`✅ Places proxy + Dev backend listening on http://localhost:${PORT}`);
+  console.log(`[DEBUG] Loaded MAPS_KEY: ${maskKey(MAPS_KEY)}`);
+});
